@@ -46,12 +46,14 @@ module.exports = function HubitatHsmModule(RED) {
 
     async function initializeHsm() {
       return node.hubitat.getHsm().then((hsm) => {
-        if (!hsm) { throw new Error(JSON.stringify(hsm)); }
+        if (!hsm || hsm.hsm === undefined) {
+          throw new Error(`Unexpected HSM response: ${JSON.stringify(hsm).slice(0, 200)}`);
+        }
         node.currentHsm = hsm.hsm;
         node.log(`Initialized. HSM: ${node.currentHsm}`);
         node.updateStatus('blue', node.currentHsm);
       }).catch((err) => {
-        node.warn(`Unable to initialize HSM: ${err.message}`);
+        node.warn(`Unable to initialize HSM: ${err.message}. Hubitat at ${node.hubitat.baseUrl} may be unreachable.`);
         node.updateStatus('red', 'Uninitialized');
         throw err;
       });
@@ -118,7 +120,31 @@ module.exports = function HubitatHsmModule(RED) {
     this.hubitat.hubitatEvent.on('websocket-closed', wsClosed);
     this.hubitat.hubitatEvent.on('websocket-error', wsClosed);
 
-    initializeHsm().catch(() => {});
+    let initRetryTimer = null;
+    const retryDelays = [5000, 10000, 20000, 40000, 60000];
+    function retryInit(attempt) {
+      if (attempt >= retryDelays.length) {
+        node.warn('HSM node: giving up on initialization after maximum retries. Will retry on next event or input.');
+        return;
+      }
+      const delay = retryDelays[attempt];
+      node.debug(`HSM init retry ${attempt + 1}/${retryDelays.length} in ${delay / 1000}s`);
+      initRetryTimer = setTimeout(async () => {
+        initRetryTimer = null;
+        try {
+          await initializeHsm();
+          node.log('HSM node initialized successfully after retry');
+        } catch (err) {
+          node.debug(`HSM init retry ${attempt + 1} failed: ${err.message}`);
+          retryInit(attempt + 1);
+        }
+      }, delay);
+    }
+
+    initializeHsm().catch((err) => {
+      node.warn(`HSM node started in uninitialized state: ${err.message}. Will retry automatically.`);
+      retryInit(0);
+    });
 
     node.on('input', async (msg, send, done) => {
       node.debug('Input received');
@@ -126,6 +152,7 @@ module.exports = function HubitatHsmModule(RED) {
         try {
           await initializeHsm();
         } catch (err) {
+          done(err);
           return;
         }
       }
@@ -141,6 +168,7 @@ module.exports = function HubitatHsmModule(RED) {
 
     node.on('close', () => {
       node.debug('Closed');
+      clearTimeout(initRetryTimer);
       this.hubitat.hubitatEvent.removeListener('hsm', eventCallback);
       this.hubitat.hubitatEvent.removeListener('systemStart', systemStartCallback);
       this.hubitat.hubitatEvent.removeListener('websocket-opened', wsOpened);

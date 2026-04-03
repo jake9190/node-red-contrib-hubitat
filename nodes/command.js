@@ -1,6 +1,6 @@
 /* eslint-disable global-require */
 module.exports = function HubitatCommandModule(RED) {
-  const fetch = require('node-fetch');
+  const fetch = require('./utils/fetch-with-timeout');
   const doneWithId = require('./utils/done-with-id');
 
   function HubitatCommandNode(config) {

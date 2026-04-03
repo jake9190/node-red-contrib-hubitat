@@ -44,12 +44,15 @@ module.exports = function HubitatModeModule(RED) {
 
     async function initializeMode() {
       return node.hubitat.getMode().then((mode) => {
-        if (!mode) { throw new Error(JSON.stringify(mode)); }
-        node.currentMode = mode.filter((eachMode) => eachMode.active)[0].name;
+        const activeMode = mode.find((eachMode) => eachMode.active);
+        if (!activeMode) {
+          throw new Error(`No active mode found in response: ${JSON.stringify(mode).slice(0, 200)}`);
+        }
+        node.currentMode = activeMode.name;
         node.log(`Initialized. mode: ${node.currentMode}`);
         node.updateStatus('blue', node.currentMode);
       }).catch((err) => {
-        node.warn(`Unable to initialize mode: ${err.message}`);
+        node.warn(`Unable to initialize mode: ${err.message}. Hubitat at ${node.hubitat.baseUrl} may be unreachable, or Maker API "Allow control of modes" may be disabled.`);
         node.updateStatus('red', 'Uninitialized');
         throw err;
       });
@@ -101,7 +104,31 @@ module.exports = function HubitatModeModule(RED) {
     this.hubitat.hubitatEvent.on('websocket-closed', wsClosed);
     this.hubitat.hubitatEvent.on('websocket-error', wsClosed);
 
-    initializeMode().catch(() => {});
+    let initRetryTimer = null;
+    const retryDelays = [5000, 10000, 20000, 40000, 60000];
+    function retryInit(attempt) {
+      if (attempt >= retryDelays.length) {
+        node.warn('Mode node: giving up on initialization after maximum retries. Will retry on next event or input.');
+        return;
+      }
+      const delay = retryDelays[attempt];
+      node.debug(`Mode init retry ${attempt + 1}/${retryDelays.length} in ${delay / 1000}s`);
+      initRetryTimer = setTimeout(async () => {
+        initRetryTimer = null;
+        try {
+          await initializeMode();
+          node.log('Mode node initialized successfully after retry');
+        } catch (err) {
+          node.debug(`Mode init retry ${attempt + 1} failed: ${err.message}`);
+          retryInit(attempt + 1);
+        }
+      }, delay);
+    }
+
+    initializeMode().catch((err) => {
+      node.warn(`Mode node started in uninitialized state: ${err.message}. Check Hubitat Maker API "Allow control of modes". Will retry automatically.`);
+      retryInit(0);
+    });
 
     node.on('input', async (msg, send, done) => {
       node.debug('Input received');
@@ -109,6 +136,7 @@ module.exports = function HubitatModeModule(RED) {
         try {
           await initializeMode();
         } catch (err) {
+          done(err);
           return;
         }
       }
@@ -124,6 +152,7 @@ module.exports = function HubitatModeModule(RED) {
 
     node.on('close', () => {
       node.debug('Closed');
+      clearTimeout(initRetryTimer);
       this.hubitat.hubitatEvent.removeListener('mode', eventCallback);
       this.hubitat.hubitatEvent.removeListener('systemStart', systemStartCallback);
       this.hubitat.hubitatEvent.removeListener('websocket-opened', wsOpened);

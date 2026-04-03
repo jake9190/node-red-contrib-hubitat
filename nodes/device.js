@@ -54,7 +54,7 @@ module.exports = function HubitatDeviceModule(RED) {
       try {
         await node.hubitat.devicesFetcher();
       } catch (err) {
-        node.warn(`Unable to initialize device: ${err.message}`);
+        node.warn(`Unable to initialize device (deviceId: ${node.deviceId}): ${err.message}. Hubitat at ${node.hubitat.baseUrl} may be unreachable.`);
         node.updateStatus('red', 'Uninitialized');
         throw err;
       }
@@ -143,7 +143,31 @@ module.exports = function HubitatDeviceModule(RED) {
     this.hubitat.hubitatEvent.on('websocket-closed', wsClosed);
     this.hubitat.hubitatEvent.on('websocket-error', wsClosed);
 
-    initializeDevice().catch(() => {});
+    let initRetryTimer = null;
+    const retryDelays = [5000, 10000, 20000, 40000, 60000];
+    function retryInit(attempt) {
+      if (attempt >= retryDelays.length) {
+        node.warn(`Device node (deviceId: ${node.deviceId}): giving up on initialization after maximum retries. Will retry on next event or input.`);
+        return;
+      }
+      const delay = retryDelays[attempt];
+      node.debug(`Device init retry ${attempt + 1}/${retryDelays.length} in ${delay / 1000}s`);
+      initRetryTimer = setTimeout(async () => {
+        initRetryTimer = null;
+        try {
+          await initializeDevice();
+          node.log('Device node initialized successfully after retry');
+        } catch (err) {
+          node.debug(`Device init retry ${attempt + 1} failed: ${err.message}`);
+          retryInit(attempt + 1);
+        }
+      }, delay);
+    }
+
+    initializeDevice().catch((err) => {
+      node.warn(`Device node (deviceId: ${node.deviceId}) started in uninitialized state: ${err.message}. Will retry automatically.`);
+      retryInit(0);
+    });
 
     node.on('input', async (msg, send, done) => {
       node.debug('Input received');
@@ -151,6 +175,7 @@ module.exports = function HubitatDeviceModule(RED) {
         try {
           await initializeDevice();
         } catch (err) {
+          done(err);
           return;
         }
       }
@@ -202,6 +227,7 @@ module.exports = function HubitatDeviceModule(RED) {
 
     node.on('close', () => {
       node.debug('Closed');
+      clearTimeout(initRetryTimer);
       if (node.deviceId) {
         this.hubitat.hubitatEvent.removeListener(`device.${node.deviceId}`, eventCallback);
         this.hubitat.hubitatEvent.removeListener('systemStart', systemStartCallback);

@@ -1,6 +1,6 @@
 /* eslint-disable global-require */
 module.exports = function HubitatRequestModule(RED) {
-  const fetch = require('node-fetch');
+  const fetch = require('./utils/fetch-with-timeout');
   const doneWithId = require('./utils/done-with-id');
 
   function HubitatRequestNode(config) {
@@ -29,6 +29,7 @@ module.exports = function HubitatRequestModule(RED) {
       const options = { method: 'GET' };
 
       try {
+        await node.hubitat.acquireLock();
         const response = await fetch(url, options);
         if (response.status >= 400) {
           node.status({ fill: 'red', shape: 'ring', text: 'response error' });
@@ -42,6 +43,8 @@ module.exports = function HubitatRequestModule(RED) {
       } catch (err) {
         node.status({ fill: 'red', shape: 'ring', text: err.code });
         doneWithId(node, done, err);
+      } finally {
+        node.hubitat.releaseLock();
       }
     });
   }

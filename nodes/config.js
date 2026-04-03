@@ -1,7 +1,7 @@
 /* eslint-disable no-console */
 /* eslint-disable global-require */
 module.exports = function HubitatConfigModule(RED) {
-  const fetch = require('node-fetch');
+  const fetch = require('./utils/fetch-with-timeout');
   const bodyParser = require('body-parser');
   const cookieParser = require('cookie-parser');
   const events = require('events');
@@ -138,6 +138,7 @@ Supported dataType: https://docs.hubitat.com/index.php?title=Attribute_Object`);
     }
 
     if ((!node.host) || (!node.port) || (!node.appId)) {
+      node.warn(`Hubitat config incomplete: host=${node.host || '(missing)'}, port=${node.port || '(missing)'}, appId=${node.appId || '(missing)'}. Node will not initialize.`);
       return;
     }
 
@@ -153,14 +154,37 @@ Supported dataType: https://docs.hubitat.com/index.php?title=Attribute_Object`);
         }
         mode = await response.json();
       } catch (err) {
-        node.warn(`Unable to fetch modes: ${err}`);
+        node.warn(`Unable to fetch modes from ${node.baseUrl}: ${err.message || err}`);
         throw err;
       } finally {
         node.releaseLock();
       }
 
-      node.debug(`mode: ${JSON.stringify(mode)}`);
-      return mode;
+      if (Array.isArray(mode)) {
+        // expected format: [{id:1, name:"Day", active:true}, ...]
+        node.debug(`mode: ${JSON.stringify(mode)}`);
+        return mode;
+      }
+
+      // Hubitat may return a single mode object or an error/empty object
+      if (mode && typeof mode === 'object') {
+        if (mode.error) {
+          const raw = JSON.stringify(mode).slice(0, 300);
+          throw new Error(`Hubitat returned error for modes: ${raw}. Check Hubitat Maker API "Allow control of modes".`);
+        }
+        if (mode.name !== undefined) {
+          // Single mode object — wrap in array
+          node.debug(`mode (normalized from object): ${JSON.stringify([mode])}`);
+          return [mode];
+        }
+        // Empty object {} — hub may still be starting up
+        if (Object.keys(mode).length === 0) {
+          throw new Error('Hubitat returned empty response for modes (hub may still be starting, or Maker API "Allow control of modes" is disabled)');
+        }
+      }
+
+      const raw = JSON.stringify(mode);
+      throw new Error(`Unexpected modes response from Hubitat (expected array, got ${typeof mode}): ${String(raw).slice(0, 100)}. Check Hubitat Maker API "Allow control of modes".`);
     };
 
     node.devicesFetcher = async () => {
@@ -185,11 +209,24 @@ Supported dataType: https://docs.hubitat.com/index.php?title=Attribute_Object`);
         }
         devices = await response.json();
       } catch (err) {
-        node.warn(`Unable to fetch devices: ${err}`);
+        node.warn(`Unable to fetch devices from ${node.baseUrl}: ${err.message || err}`);
         node.devicesInitialized = false;
         throw err;
       } finally {
         node.releaseLock();
+      }
+
+      if (!Array.isArray(devices)) {
+        if (devices && typeof devices === 'object' && devices.error) {
+          const raw = JSON.stringify(devices).slice(0, 300);
+          node.warn(`Hubitat returned error for devices: ${raw}`);
+          node.devicesInitialized = false;
+          throw new Error(`Hubitat returned error for devices: ${raw}`);
+        }
+        const raw = JSON.stringify(devices);
+        node.warn(`Unexpected devices response (expected array): ${String(raw).slice(0, 200)}`);
+        node.devicesInitialized = false;
+        throw new Error(`Unexpected devices response from Hubitat (expected array, got ${typeof devices}): ${String(raw).slice(0, 100)}`);
       }
 
       // convert list to map + refactor
@@ -235,13 +272,22 @@ Supported dataType: https://docs.hubitat.com/index.php?title=Attribute_Object`);
         }
         hsm = await response.json();
       } catch (err) {
-        node.warn(`Unable to fetch hsm: ${err}`);
+        node.warn(`Unable to fetch hsm from ${node.baseUrl}: ${err.message || err}`);
         throw err;
       } finally {
         node.releaseLock();
       }
 
       node.debug(`hsm: ${JSON.stringify(hsm)}`);
+      if (!hsm || typeof hsm !== 'object') {
+        const raw = JSON.stringify(hsm);
+        node.warn(`Unexpected HSM response (expected object with hsm property): ${String(raw).slice(0, 200)}`);
+        throw new Error(`Unexpected HSM response from Hubitat (got ${typeof hsm}): ${String(raw).slice(0, 100)}`);
+      }
+      if (hsm.error) {
+        const raw = JSON.stringify(hsm).slice(0, 300);
+        throw new Error(`Hubitat returned error for HSM: ${raw}`);
+      }
       return hsm;
     };
     node.updateDevice = (event) => {
@@ -263,7 +309,7 @@ Supported dataType: https://docs.hubitat.com/index.php?title=Attribute_Object`);
         node.hubitatEvent.emit('systemStart');
       }
       node.hubitatEvent.emit('event', event);
-      if (event.deviceId) { // webhook: deviceId=null, websocket: deviceId=0
+      if (event.deviceId !== undefined && event.deviceId !== null) {
         node.updateDevice(event);
         node.hubitatEvent.emit(`device.${event.deviceId}`, event);
       } else if (event.name === 'mode') {
@@ -293,8 +339,10 @@ Supported dataType: https://docs.hubitat.com/index.php?title=Attribute_Object`);
         node.reconnectTimeout = null;
         node.pingTimeout = null;
         const wsScheme = ((this.usetls) ? 'wss' : 'ws');
-        const socket = new WebSocket(`${wsScheme}://${node.host}:${this.port}/eventsocket`);
-        socket.setMaxListeners(0);
+        const wsUrl = `${wsScheme}://${node.host}:${this.port}/eventsocket`;
+        node.log(`Connecting to Hubitat websocket at ${wsUrl} (attempt ${reconnectAttempt + 1})`);
+        const socket = new WebSocket(wsUrl);
+        socket.setMaxListeners(20);
         node.wsServer = socket; // keep for closing
 
         const reconnect = (cause) => {
@@ -328,7 +376,6 @@ Supported dataType: https://docs.hubitat.com/index.php?title=Attribute_Object`);
         socket.on('close', () => {
           node.log('Websocket closed');
           node.wsStatusOk = false;
-          node.wsFirstInitPending = false;
           node.hubitatEvent.emit('websocket-closed');
           clearTimeout(this.pingTimeout);
           if (!node.closing) {
@@ -343,13 +390,12 @@ Supported dataType: https://docs.hubitat.com/index.php?title=Attribute_Object`);
               eventDispatcher(event);
             }
           } catch (err) {
-            // ignore error
+            node.warn(`Failed to parse websocket message: ${err.message}. Raw: ${String(message).slice(0, 200)}`);
           }
         });
         socket.on('error', (err) => {
-          node.error(`Websocket error: ${JSON.stringify(err)}`);
+          node.error(`Websocket connection to ${node.host}:${node.port} failed: ${err.message || JSON.stringify(err)}`);
           node.wsStatusOk = false;
-          node.wsFirstInitPending = false;
           node.hubitatEvent.emit('websocket-error', { error: err });
           reconnectAttempt += 1;
           reconnect('error');
@@ -402,11 +448,12 @@ Supported dataType: https://docs.hubitat.com/index.php?title=Attribute_Object`);
       if (node.useWebsocket) {
         node.closing = true;
         clearTimeout(node.reconnectTimeout);
-        node.wsServer.close();
-        for (const ws of node.wsServer.clients) {
-          ws.terminate();
+        clearTimeout(node.pingTimeout);
+        if (node.wsServer) {
+          node.wsServer.removeAllListeners();
+          node.wsServer.close();
         }
-      } else { // webhook
+      } else if (RED.httpNode._router) { // webhook
         // eslint-disable-next-line no-underscore-dangle
         RED.httpNode._router.stack.forEach((route, i, routes) => {
           if (route.route && route.route.path === node.webhookPath && route.route.methods.post) {

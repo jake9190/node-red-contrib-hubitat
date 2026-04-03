@@ -1,6 +1,6 @@
 /* eslint-disable global-require */
 module.exports = function HubitatModeSetterModule(RED) {
-  const fetch = require('node-fetch');
+  const fetch = require('./utils/fetch-with-timeout');
   const doneWithId = require('./utils/done-with-id');
 
   // All possible HE event values: https://github.com/fblackburn1/node-red-contrib-hubitat/pull/9#issuecomment-602258248
@@ -78,6 +78,7 @@ module.exports = function HubitatModeSetterModule(RED) {
       const options = { method: 'GET' };
 
       try {
+        await node.hubitat.acquireLock();
         node.debug(`Request: ${baseUrl}`);
         const response = await fetch(url, options);
         if (response.status >= 400) {
@@ -93,6 +94,8 @@ module.exports = function HubitatModeSetterModule(RED) {
       } catch (err) {
         node.status({ fill: 'red', shape: 'ring', text: err.code });
         doneWithId(node, done, err);
+      } finally {
+        node.hubitat.releaseLock();
       }
     });
   }

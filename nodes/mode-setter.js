@@ -1,6 +1,6 @@
 /* eslint-disable global-require */
 module.exports = function HubitatModeSetterModule(RED) {
-  const fetch = require('node-fetch');
+  const fetch = require('./utils/fetch-with-timeout');
   const doneWithId = require('./utils/done-with-id');
 
   function HubitatModeSetterNode(config) {
@@ -18,7 +18,6 @@ module.exports = function HubitatModeSetterModule(RED) {
     }
     async function fetchAvailableModes() {
       return node.hubitat.getMode().then((mode) => {
-        if (!mode) { throw new Error(JSON.stringify(mode)); }
         node.availableModes = mode.reduce((accumulator, value) => {
           accumulator[value.name] = value.id;
           return accumulator;
@@ -41,6 +40,7 @@ module.exports = function HubitatModeSetterModule(RED) {
           try {
             await fetchAvailableModes();
           } catch (err) {
+            done(err);
             return;
           }
         }
@@ -61,6 +61,7 @@ module.exports = function HubitatModeSetterModule(RED) {
       const options = { method: 'GET' };
 
       try {
+        await node.hubitat.acquireLock();
         node.debug(`Request: ${baseUrl}`);
         const response = await fetch(url, options);
         if (response.status >= 400) {
@@ -76,6 +77,8 @@ module.exports = function HubitatModeSetterModule(RED) {
       } catch (err) {
         node.status({ fill: 'red', shape: 'ring', text: err.code });
         doneWithId(node, done, err);
+      } finally {
+        node.hubitat.releaseLock();
       }
     });
   }
